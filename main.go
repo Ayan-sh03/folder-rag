@@ -314,6 +314,9 @@ func watchFolder(path string) error {
 	fmt.Printf("Started watching directory: %s\n", path)
 	fmt.Println("Press Ctrl+C to stop...")
 
+	// handleQuery(ctx, milvusClient)
+	// queryCollection(ctx, milvusClient, "demonstrate the functionality")
+	handleQuery(ctx, milvusClient)
 	<-make(chan struct{})
 	return nil
 }

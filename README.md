@@ -52,20 +52,28 @@ export OPENROUTER_API_KEY='your-openrouter-key'
 
 ## Usage
 
-1. Start the application:
+1. Start the application by specifying a folder to watch:
 ```bash
 go run main.go [directory-path]
 ```
 If no directory path is provided, it will watch the current directory.
 
-2. The system will:
-   - Monitor the specified directory for new text files
-   - Process any new .txt files automatically
-   - Provide a command-line interface for asking questions
+2. Knowledge Base Creation:
+   - All existing .txt files in the specified folder will be automatically processed and added to the AI knowledge base
+   - The system continues to monitor the folder for any new .txt files
+   - New files are automatically processed and added to the knowledge base in real-time
+   - Provides immediate access to the information contained in all text files
 
-3. Interacting with the system:
+3. System Operation:
+   - Monitors the specified directory for new text files
+   - Processes all text files (both existing and new) automatically
+   - Maintains an up-to-date knowledge base for AI queries
+   - Provides a command-line interface for asking questions
+
+4. Interacting with the system:
    - Type your questions when prompted
-   - The system will search the knowledge base and provide relevant answers
+   - The AI will search through the knowledge base created from your text files
+   - Get intelligent responses based on the content of your documents
    - Type 'quit' to exit
 
 ## Text Processing Details

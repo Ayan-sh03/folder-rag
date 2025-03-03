@@ -27,8 +27,10 @@ const (
 	shardNum       = 2 // number of shards for collection
 	replicateAPI   = "https://api.replicate.com/v1/predictions"
 	modelVersion   = "a06276a89f1a902d5fc225a9ca32b6e8e6292b7f3b136518878da97c458e2bad"
+	topK           = 5 // number of results to return in search
 )
 
+// ReplicateRequest for embedding API
 type ReplicateRequest struct {
 	Version string `json:"version"`
 	Input   struct {
@@ -38,11 +40,67 @@ type ReplicateRequest struct {
 	} `json:"input"`
 }
 
+// ReplicateResponse from embedding API
 type ReplicateResponse struct {
 	ID     string      `json:"id"`
 	Status string      `json:"status"`
 	Output [][]float32 `json:"output"`
 	Error  string      `json:"error,omitempty"`
+}
+
+// SearchResult represents a single document match from Milvus
+type SearchResult struct {
+	Text     string
+	Filename string
+	Score    float32
+}
+
+// Message represents a chat message
+type Message struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+// Tool represents a function that the AI can call
+type Tool struct {
+	Type     string    `json:"type"`
+	Function *Function `json:"function,omitempty"`
+}
+
+// Function represents the details of a callable function
+type Function struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"`
+}
+
+// ChatRequest represents the request payload to the API
+type ChatRequest struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Tools    []Tool    `json:"tools,omitempty"`
+}
+
+// ToolCall represents a tool call in the response
+type ToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function *struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// ChatResponse represents the API response
+type ChatResponse struct {
+	Choices []struct {
+		Message struct {
+			Content   string     `json:"content,omitempty"`
+			ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+		} `json:"message"`
+	} `json:"choices"`
 }
 
 // getEmbedding gets embeddings from Replicate API
@@ -241,6 +299,262 @@ func processTextFile(ctx context.Context, milvusClient client.Client, filePath s
 	return nil
 }
 
+// queryCollection performs a similarity search in the Milvus collection
+func queryCollection(ctx context.Context, milvusClient client.Client, queryText string) ([]SearchResult, error) {
+	// Get embedding for query text
+	queryEmbedding, err := getEmbedding(queryText)
+	if err != nil {
+		return nil, fmt.Errorf("error getting query embedding: %v", err)
+	}
+
+	fmt.Println("Query Embedding:", queryEmbedding)
+
+	// Prepare search parameters
+	sp, err := entity.NewIndexIvfFlatSearchParam(10) // probe 10 clusters
+	if err != nil {
+		return nil, fmt.Errorf("error creating search parameters: %v", err)
+	}
+
+	// Load collection if not already loaded
+	err = milvusClient.LoadCollection(ctx, collectionName, false)
+	if err != nil {
+		return nil, fmt.Errorf("error loading collection: %v", err)
+	}
+
+	// Prepare search request
+	outputFields := []string{"text", "filename"}
+	expr := "" // no expression filter
+	vector := []entity.Vector{entity.FloatVector(queryEmbedding)}
+	searchResult, err := milvusClient.Search(
+		ctx,
+		collectionName,
+		[]string{},   // partition names (empty for all)
+		expr,         // filter expression
+		outputFields, // output fields to retrieve
+		vector,       // search vectors
+		"embedding",  // vector field name
+		entity.L2,    // metric type
+		topK,         // limit
+		sp,           // search params
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("error searching collection: %v", err)
+	}
+
+	// Process results
+	var results []SearchResult
+	for idx := 0; idx < topK && idx < len(searchResult) && len(searchResult[0].IDs.(*entity.ColumnInt64).Data()) > idx; idx++ {
+		text := searchResult[0].Fields[0].(*entity.ColumnVarChar).Data()[idx]
+		filename := searchResult[0].Fields[1].(*entity.ColumnVarChar).Data()[idx]
+		score := searchResult[0].Scores[idx]
+		results = append(results, SearchResult{
+			Text:     text,
+			Filename: filename,
+			Score:    score,
+		})
+	}
+
+	fmt.Println("Search Results:", results)
+
+	return results, nil
+}
+
+// formatMilvusResults formats the search results to provide context to the LLM
+func formatMilvusResults(results []SearchResult) string {
+	if len(results) == 0 {
+		return "No relevant information found in the knowledge base."
+	}
+
+	var builder strings.Builder
+	builder.WriteString("Here is relevant information from the knowledge base:\n\n")
+
+	for i, result := range results {
+		builder.WriteString(fmt.Sprintf("DOCUMENT %d (Source: %s):\n%s\n\n",
+			i+1, result.Filename, result.Text))
+	}
+
+	return builder.String()
+}
+
+// makeAPICall handles the HTTP request to the OpenRouter API
+func makeAPICall(apiKey string, messages []Message, tools []Tool) (*ChatResponse, error) {
+	url := "https://openrouter.ai/api/v1/chat/completions"
+
+	requestBody := ChatRequest{
+		Model:    "google/gemini-2.0-flash-001", // Model with tool calling support
+		Messages: messages,
+		Tools:    tools,
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling JSON: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("HTTP-Referer", "http://localhost")
+	req.Header.Set("X-Title", "RAG System")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var chatResponse ChatResponse
+	err = json.Unmarshal(body, &chatResponse)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshaling response: %v", err)
+	}
+
+	return &chatResponse, nil
+}
+
+// handleLLMQuery integrates the Milvus query with the LLM tool calling
+func handleLLMQuery(ctx context.Context, milvusClient client.Client) {
+	reader := bufio.NewReader(os.Stdin)
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		fmt.Println("Please set OPENROUTER_API_KEY environment variable")
+		return
+	}
+
+	// Define query tool for knowledge base
+	queryTool := Tool{
+		Type: "function",
+		Function: &Function{
+			Name:        "query_knowledge_base",
+			Description: "Query the vector database knowledge base for relevant information",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"question": map[string]string{
+						"type":        "string",
+						"description": "The question to search for in the knowledge base",
+					},
+				},
+				"required": []string{"question"},
+			},
+		},
+	}
+
+	fmt.Println("\n=== RAG System with LLM ===")
+	fmt.Println("This system combines vector search with an LLM to answer your questions.")
+	fmt.Println("Type 'quit' to exit.")
+
+	for {
+		fmt.Print("\nEnter your question: ")
+		userQuery, _ := reader.ReadString('\n')
+		userQuery = strings.TrimSpace(userQuery)
+
+		if userQuery == "quit" {
+			break
+		}
+
+		if userQuery == "" {
+			continue
+		}
+
+		// Start with user query
+		initialMessages := []Message{
+			{
+				Role:    "user",
+				Content: userQuery,
+			},
+		}
+
+		// Make initial API call to determine if we need to use the knowledge base
+		fmt.Println("\nProcessing your question...")
+		response, err := makeAPICall(apiKey, initialMessages, []Tool{queryTool})
+		if err != nil {
+			fmt.Printf("Error in API call: %v\n", err)
+			continue
+		}
+
+		// Process response
+		if len(response.Choices) == 0 {
+			fmt.Println("No response from LLM.")
+			continue
+		}
+
+		// Check if it's a direct response or needs knowledge base lookup
+		message := response.Choices[0].Message
+
+		// If no tool calls, just output the content
+		if len(message.ToolCalls) == 0 {
+			fmt.Println("\nAnswer:", message.Content)
+			continue
+		}
+
+		// Handle tool calls (knowledge base query)
+		fmt.Println("Searching knowledge base...")
+		messages := append(initialMessages, Message{
+			Role:      "assistant",
+			ToolCalls: message.ToolCalls,
+		})
+
+		// Process each tool call
+		for _, toolCall := range message.ToolCalls {
+			if toolCall.Function.Name == "query_knowledge_base" {
+				// Parse arguments
+				var args struct {
+					Question string `json:"question"`
+				}
+				if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
+					fmt.Printf("Error parsing arguments: %v\n", err)
+					continue
+				}
+
+				// Query the Milvus database
+				results, err := queryCollection(ctx, milvusClient, args.Question)
+				if err != nil {
+					fmt.Printf("Error querying knowledge base: %v\n", err)
+					continue
+				}
+
+				// Format the results
+				formattedResults := formatMilvusResults(results)
+
+				// Add results to messages for LLM
+				messages = append(messages, Message{
+					Role:       "tool",
+					Content:    formattedResults,
+					ToolCallID: toolCall.ID,
+				})
+			}
+		}
+
+		// Make final API call with knowledge base results
+		finalResponse, err := makeAPICall(apiKey, messages, nil)
+		if err != nil {
+			fmt.Printf("Error in follow-up API call: %v\n", err)
+			continue
+		}
+
+		// Print final answer
+		if len(finalResponse.Choices) > 0 {
+			fmt.Println("\nAnswer:", finalResponse.Choices[0].Message.Content)
+		}
+	}
+}
+
 func watchFolder(path string) error {
 	// Create Milvus client
 	ctx := context.Background()
@@ -314,9 +628,9 @@ func watchFolder(path string) error {
 	fmt.Printf("Started watching directory: %s\n", path)
 	fmt.Println("Press Ctrl+C to stop...")
 
-	// handleQuery(ctx, milvusClient)
-	// queryCollection(ctx, milvusClient, "demonstrate the functionality")
-	handleQuery(ctx, milvusClient)
+	// Use the new integrated LLM query handler instead of the old one
+	handleLLMQuery(ctx, milvusClient)
+
 	<-make(chan struct{})
 	return nil
 }
@@ -351,8 +665,8 @@ func printFileDetails(path string) {
 }
 
 func main() {
-	fmt.Println("Starting file watcher...")
-	dir := "test" // Default to test directory
+	fmt.Println("Starting RAG system with LLM integration...")
+	dir := "." // Default to test directory
 	if len(os.Args) > 1 {
 		dir = os.Args[1]
 	}
